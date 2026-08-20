@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REGISTRY: ghcr.io
-      IMAGE_NAME: ${{ github.repository }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     permissions:
@@ -22,43 +21,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      # GHCR rejects image names containing uppercase letters, and this fork
+      # lives under "x4FF3". metadata-action lowercases the tags it generates,
+      # but attest-build-provenance consumes IMAGE_NAME verbatim, so normalise
+      # it once here for every consumer. Deliberately not set as a job-level
+      # env var: that would collide with this value at step scope.
+      - name: Normalise image name
+        run: echo "IMAGE_NAME=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       - name: docker
         uses: ./.github/actions/docker
         with:
           publish: true
-    
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-      pull-requests: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          ref: master
-
-      - name: Update changelog
-        id: update_changelog
-        uses: thomaseizinger/keep-a-changelog-new-release@3.1.0
-        with:
-          tag: ${{ github.ref_name }}
-
-      - name: Release
-        uses: softprops/action-gh-release@v3
-        with:
-          body: ${{ steps.update_changelog.outputs.release-notes }}
-          draft: false
-          prerelease: false
-
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v7
-        with:
-          title: Release ${{ github.ref_name }}
-          branch: release/${{ github.ref_name }}
-          labels: release
-          commit-message: "[ci skip] update changelog for ${{ github.ref_name }}"
-          body: This PR was created by the release workflow.
