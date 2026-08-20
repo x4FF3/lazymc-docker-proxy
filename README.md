@@ -267,6 +267,74 @@ volumes:
   data:
 ```
 
+### Bedrock clients (GeyserMC)
+
+A Geyser plugin lives inside the Minecraft server, so its Bedrock port goes down
+together with the server and a Bedrock client sees nothing at all while lazymc
+sleeps. Add a `lazymc.forward.<name>.*` rule and lazymc holds that port itself:
+it answers the Bedrock server browser with a MOTD while asleep, wakes the server
+when a client tries to join, then forwards the traffic on.
+
+Publish the Bedrock port on the **lazymc** container, not on the Minecraft one.
+
+```yaml
+networks:
+  minecraft-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
+
+services:
+  lazymc:
+    image: ghcr.io/joesturge/lazymc-docker-proxy:latest
+    networks:
+      minecraft-network:
+        ipv4_address: 172.18.0.2
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - data:/server:ro
+    ports:
+      - "25565:25565"
+      # Bedrock is UDP, the suffix is required
+      - "19132:19132/udp"
+
+  mc:
+    image: itzg/minecraft-server:java25
+    networks:
+      minecraft-network:
+        ipv4_address: 172.18.0.3
+    labels:
+      - lazymc.enabled=true
+      - lazymc.group=mc
+      - lazymc.server.address=mc:25565
+      # Hold UDP 19132 for Geyser: `geyser` is just a name to group the labels
+      - lazymc.forward.geyser.server=mc:19132
+      - lazymc.forward.geyser.proto=bedrock
+    tty: true
+    stdin_open: true
+    restart: no
+    environment:
+      EULA: "TRUE"
+      TYPE: PAPER
+      PLUGINS: |
+        https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot
+    volumes:
+      - data:/data
+
+volumes:
+  data:
+```
+
+A Bedrock client sees `lazymc.motd.sleeping` in its server list while the server
+is asleep, and `lazymc.motd.starting` once it has been woken. Bedrock has no
+"hold the client" mechanism, so the first join attempt fails while the server
+boots and the player has to hit join again once the MOTD reports it online.
+
+> Note: this needs the main `lazymc` binary. Servers below 1.20.3 run the legacy
+> binary (see `lazymc.public.version`), which has no forwarding support.
+
 ### Configuration using labels
 
 The suggested way to manage the lazymc settings on your minecraft containers is to use container labels.
@@ -280,6 +348,13 @@ which will be picked up by `lazymc-docker-proxy` (\* is required):
 - **\*lazymc.server.address** - The address of the Docker Minecraft server to manage, should use the internal Docker network address of the server container, such as `mc:25565` or the assigned static IP such as `172.18.0.3:25565`.
 - **\*lazymc.group** - This is used by `lazymc-docker-proxy` to locate the container to start and stop
 - **lazymc.port** - The port on the `lazymc-docker-proxy` container this server will be accessible from. Defaults to `25565`.
+- **lazymc.forward.\<name\>.server** - Address of an extra service inside the Minecraft container to forward to, such as `mc:19132`. `\<name\>` groups the labels of one rule together and can be anything. Required to declare a rule.
+- **lazymc.forward.\<name\>.public** - Address lazymc listens on for this rule. Defaults to `0.0.0.0:` plus the port of `server`.
+- **lazymc.forward.\<name\>.proto** - One of `bedrock`, `udp` or `tcp`. Defaults to `bedrock`. Use `bedrock` for GeyserMC: it answers the RakNet server browser while the server sleeps, `udp` forwards blindly.
+- **lazymc.forward.\<name\>.wake** - Whether traffic on this port wakes the server. Defaults to true.
+- **lazymc.forward.\<name\>.session_timeout** - Seconds an idle UDP session is kept before being dropped. Defaults to 30.
+- **lazymc.forward.\<name\>.bedrock_version** - Version shown to Bedrock clients before lazymc has ever seen the real server. Only used with `proto=bedrock`.
+- **lazymc.forward.\<name\>.bedrock_protocol** - Protocol number shown alongside it. Only used with `proto=bedrock`.
 - **lazymc.join.methods** - Methods to use to occupy a client on join while the server is starting (separated by commas).
 - **lazymc.join.kick.starting** - Message shown when client is kicked while server is starting.
 - **lazymc.join.kick.stopping** - Message shown when client is kicked while server is stopping.

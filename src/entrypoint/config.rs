@@ -109,10 +109,120 @@ struct ConfigSection {
     version: Option<String>,
 }
 
+/// An additional port lazymc holds and forwards while the server sleeps.
+///
+/// Serialized as a TOML array of tables (`[[forward]]`). Used for sidecar
+/// services living inside the Minecraft container, GeyserMC above all, whose
+/// ports go down together with the server.
+#[derive(Serialize, Deserialize, Clone)]
+struct ForwardSection {
+    public: String,
+    server: String,
+    proto: Option<String>,
+    wake: Option<bool>,
+    session_timeout: Option<i32>,
+    bedrock_version: Option<String>,
+    bedrock_protocol: Option<i32>,
+}
+
+/// Accepted values for `lazymc.forward.<name>.proto`.
+const FORWARD_PROTOS: [&str; 3] = ["bedrock", "tcp", "udp"];
+
+/// Protocol assumed when a forward rule does not name one.
+///
+/// This feature exists for GeyserMC above all, so the RakNet-aware variant is
+/// the least surprising default.
+const FORWARD_PROTO_DEFAULT: &str = "bedrock";
+
+/// Resolve a forward target to an IPv4 `host:port`, keeping the literal on failure.
+///
+/// Mirrors how `lazymc.server.address` is handled: the Minecraft container may
+/// well be stopped while this runs, and then its name does not resolve yet.
+fn resolve_forward_address(name: &str, address: &str) -> String {
+    address
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.find(|addr| addr.is_ipv4()))
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| {
+            warn!(target: "lazymc-docker-proxy::entrypoint::config", "Failed to resolve IP address from lazymc.forward.{}.server. Falling back to the value provided.", name);
+            address.to_string()
+        })
+}
+
+/// Collect `[[forward]]` rules from `lazymc.forward.<name>.<field>` labels.
+///
+/// The rule name only groups the labels of one rule together, it never reaches
+/// the generated config. `lazymc.join.forward.*` cannot collide with this: it
+/// does not carry the `lazymc.forward.` prefix.
+fn forward_sections(labels: &HashMap<String, String>) -> Vec<ForwardSection> {
+    let mut names: Vec<String> = labels
+        .keys()
+        .filter_map(|key| key.strip_prefix("lazymc.forward."))
+        .filter_map(|rest| rest.split('.').next())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let field = |field: &str| labels.get(&format!("lazymc.forward.{}.{}", name, field));
+
+            let server: String = field("server")
+                .cloned()
+                .unwrap_or_else(|| {
+                    error!(target: "lazymc-docker-proxy::entrypoint::config", "lazymc.forward.{}.server is not set", name);
+                    health::unhealthy();
+                    exit(1);
+                });
+
+            // The port has to be pinned here already: it is what the public
+            // address falls back to, and lazymc rejects a bare host anyway
+            let port: u16 = server
+                .rsplit(':')
+                .next()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or_else(|| {
+                    error!(target: "lazymc-docker-proxy::entrypoint::config", "lazymc.forward.{}.server must be in host:port form, got '{}'", name, server);
+                    health::unhealthy();
+                    exit(1);
+                });
+
+            let proto: String = field("proto")
+                .cloned()
+                .unwrap_or_else(|| FORWARD_PROTO_DEFAULT.to_string());
+            if !FORWARD_PROTOS.contains(&proto.as_str()) {
+                error!(target: "lazymc-docker-proxy::entrypoint::config", "lazymc.forward.{}.proto must be one of {:?}, got '{}'", name, FORWARD_PROTOS, proto);
+                health::unhealthy();
+                exit(1);
+            }
+
+            ForwardSection {
+                public: field("public")
+                    .cloned()
+                    .unwrap_or_else(|| format!("0.0.0.0:{}", port)),
+                server: resolve_forward_address(&name, &server),
+                proto: Some(proto),
+                wake: field("wake").map(|wake| wake == "true"),
+                session_timeout: field("session_timeout").and_then(|x| x.parse().ok()),
+                bedrock_version: field("bedrock_version").cloned(),
+                bedrock_protocol: field("bedrock_protocol").and_then(|x| x.parse().ok()),
+            }
+        })
+        .collect()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Config {
     advanced: AdvancedSection,
     config: ConfigSection,
+    // must serialize as an empty-skipped array: a bare `forward = []` emitted
+    // after the section tables above would make toml::to_string fail
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    forward: Vec<ForwardSection>,
     join: JoinSection,
     lockout: LockoutSection,
     motd: MotdSection,
@@ -337,6 +447,7 @@ impl Config {
             lockout: lockout_section,
             advanced: advanced_section,
             config: config_section,
+            forward: forward_sections(&labels),
             start_command: match is_legacy(labels.get("lazymc.public.version").cloned()) {
                 true => "lazymc-legacy".to_string(),
                 false => "lazymc".to_string(),
@@ -463,5 +574,128 @@ impl Config {
         }
 
         Config::from_container_labels(labels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn forward_labels_are_grouped_into_one_rule_per_name() {
+        let sections = forward_sections(&labels(&[
+            ("lazymc.forward.geyser.server", "127.0.0.1:19132"),
+            ("lazymc.forward.geyser.bedrock_version", "1.21.0"),
+            ("lazymc.forward.geyser.bedrock_protocol", "685"),
+            ("lazymc.forward.voice.server", "127.0.0.1:24454"),
+            ("lazymc.forward.voice.proto", "udp"),
+            ("lazymc.forward.voice.wake", "false"),
+            ("lazymc.forward.voice.session_timeout", "60"),
+        ]));
+
+        assert_eq!(sections.len(), 2);
+
+        // sorted by rule name, so geyser comes first
+        assert_eq!(sections[0].proto.as_deref(), Some("bedrock"));
+        assert_eq!(sections[0].bedrock_version.as_deref(), Some("1.21.0"));
+        assert_eq!(sections[0].bedrock_protocol, Some(685));
+        assert_eq!(sections[0].wake, None);
+
+        assert_eq!(sections[1].proto.as_deref(), Some("udp"));
+        assert_eq!(sections[1].wake, Some(false));
+        assert_eq!(sections[1].session_timeout, Some(60));
+    }
+
+    #[test]
+    fn forward_public_defaults_to_the_server_port_on_all_interfaces() {
+        let sections = forward_sections(&labels(&[(
+            "lazymc.forward.geyser.server",
+            "127.0.0.1:19132",
+        )]));
+
+        assert_eq!(sections[0].public, "0.0.0.0:19132");
+        assert_eq!(sections[0].server, "127.0.0.1:19132");
+    }
+
+    #[test]
+    fn forward_public_is_taken_verbatim_when_given() {
+        let sections = forward_sections(&labels(&[
+            ("lazymc.forward.geyser.server", "127.0.0.1:19132"),
+            ("lazymc.forward.geyser.public", "0.0.0.0:19133"),
+        ]));
+
+        assert_eq!(sections[0].public, "0.0.0.0:19133");
+    }
+
+    #[test]
+    fn join_forward_labels_are_not_mistaken_for_forward_rules() {
+        let sections = forward_sections(&labels(&[
+            ("lazymc.join.forward.address", "127.0.0.1:25565"),
+            ("lazymc.join.forward.send_proxy_v2", "true"),
+        ]));
+
+        assert!(sections.is_empty());
+    }
+
+    /// Renders a config through the real serializer, in a scratch directory
+    /// since `from_container_labels` writes the generated file to the cwd.
+    fn render(extra: &[(&str, &str)]) -> String {
+        use std::sync::Mutex;
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("ldp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        std::env::set_var("LAZYMC_VERSION", "0.2.11");
+        std::env::set_var("LAZYMC_LEGACY_VERSION", "0.2.10");
+
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("lazymc.group", "mc"),
+            ("lazymc.server.address", "127.0.0.1:25565"),
+        ];
+        pairs.extend_from_slice(extra);
+
+        let toml = Config::from_container_labels(labels(&pairs)).as_toml_string();
+
+        std::env::set_current_dir(previous).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        toml
+    }
+
+    #[test]
+    fn forward_rules_render_as_an_array_of_tables() {
+        let toml = render(&[
+            ("lazymc.forward.geyser.server", "127.0.0.1:19132"),
+            ("lazymc.forward.geyser.proto", "bedrock"),
+        ]);
+
+        assert!(toml.contains("[[forward]]"), "{}", toml);
+
+        let parsed: toml::Table = toml.parse().unwrap();
+        let forward = parsed["forward"].as_array().unwrap();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0]["public"].as_str(), Some("0.0.0.0:19132"));
+        assert_eq!(forward[0]["proto"].as_str(), Some("bedrock"));
+    }
+
+    /// A bare `forward = []` would be emitted after the section tables above it,
+    /// which the TOML serializer rejects outright. Every existing user without
+    /// forward rules runs through this path, so it must stay empty-skipped.
+    #[test]
+    fn a_config_without_forward_rules_still_renders() {
+        let toml = render(&[]);
+
+        assert!(!toml.contains("forward = []"), "{}", toml);
+        toml.parse::<toml::Table>().unwrap();
     }
 }

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `lazymc.forward.<name>.*` labels, generating `[[forward]]` rules for lazymc.
+  Lets lazymc hold extra ports while the server sleeps, GeyserMC (Bedrock/UDP)
+  above all, answering the Bedrock server browser and waking the server on join.
+- `LAZYMC_REPO` and `LAZYMC_REF` build args selecting the lazymc source. Default
+  to a fork carrying the `[[forward]]` support.
+
 ## [2.7.5] - 2026-06-20
 
 ### Updated

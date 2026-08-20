@@ -2,6 +2,12 @@
 ARG LAZYMC_VERSION=0.2.11
 ARG LAZYMC_LEGACY_VERSION=0.2.10
 
+# source the main lazymc binary is built from
+# defaults to a fork carrying [[forward]] support for Bedrock/GeyserMC
+# set LAZYMC_REF to v$LAZYMC_VERSION and LAZYMC_REPO to the upstream URL for a stock build
+ARG LAZYMC_REPO=https://github.com/x4FF3/lazymc
+ARG LAZYMC_REF=feat/bedrock-geyser-port-forwarding
+
 # set up rust
 FROM --platform=$BUILDPLATFORM rust:1.92-slim AS rust-setup
 ARG TARGETARCH
@@ -26,11 +32,15 @@ FROM --platform=$BUILDPLATFORM rust-setup AS lazymc-builder
 WORKDIR /usr/src/lazymc
 ARG LAZYMC_VERSION
 ENV LAZYMC_VERSION=$LAZYMC_VERSION
-RUN git clone --branch v$LAZYMC_VERSION https://github.com/timvisee/lazymc .
+ARG LAZYMC_REPO
+ARG LAZYMC_REF
+RUN git clone --branch "$LAZYMC_REF" "$LAZYMC_REPO" .
 RUN cargo build --target "$(cat /rust-arch)" --release --locked
 RUN mv /usr/src/lazymc/target/"$(cat /rust-arch)" /usr/src/lazymc/target/output_final
 
 # build lazymc-legacy
+# stays on stock upstream: this binary only serves Minecraft below 1.20.3 and
+# has no [[forward]] support, so Bedrock forwarding needs public.version >= 1.20.3
 FROM --platform=$BUILDPLATFORM rust-setup AS lazymc-legacy-builder
 WORKDIR /usr/src/lazymc
 ARG LAZYMC_LEGACY_VERSION
